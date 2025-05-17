@@ -1,6 +1,5 @@
 import os
 import datetime
-from pathlib import Path
 from urllib.parse import quote_plus
 from pyspark.sql import SparkSession
 from pyspark import SparkConf
@@ -76,8 +75,9 @@ class MariadbExtractor:
             name = t['name']
             target_name = t['target_name']
             iterate_column_type = t['iterate_column_type']
-            iterate_batch_size = t.get(
-                'iterate_batch_size', self.settings.default_iterate_batch_size
+            chunk_count_for_partition = t.get(
+                'chunk_count_for_partition',
+                self.settings.default_chunk_count_for_partition,
             )
             iterate_max_loop = t.get(
                 'iterate_max_loop', self.settings.default_iterate_max_loop
@@ -99,7 +99,6 @@ class MariadbExtractor:
 
             partitions_column = partitions_column_.split(' as ')[0].strip()
             p_col_name = partitions_column_.split(' as ')[-1].strip()
-            p_col_select = f'{partitions_column} as {p_col_name}'
 
             message = dict(table_name=target_name, status='extracting')
             logger.info(message)
@@ -110,57 +109,44 @@ class MariadbExtractor:
             last_point = self.backend.get_last_point(target_name)
             if last_point:
                 write_mode = 'append'
-
-                iterate_query = f"""(SELECT {p_col_select} from {name} where {partitions_column} > '{last_point}' ) q"""
-
-                df_itarate_list = (
-                    spark.read.format('jdbc')
-                    .option('url', self.jdbc_url)
-                    .option('dbtable', iterate_query)
-                    .option('driver', self.driver_jdbc)
-                    .option('fetchsize', fetchsize)
-                    .load()
-                )
-
-                min_val = last_point
-                max_val = df_itarate_list.agg(F.max(p_col_name).alias('max')).collect()[
-                    0
-                ][0]
-                df_itarate_list = df_itarate_list.where(F.col(p_col_name) > min_val)
+                iterate_query = f"""(SELECT min({partitions_column}) as min_val, max({partitions_column}) as max_val from {name} where {partitions_column} > '{last_point}' ) q"""
             else:
                 write_mode = 'overwrite'
+                iterate_query = f"""(SELECT min({partitions_column}) as min_val, max({partitions_column}) as max_val from {name}) q"""
 
-                iterate_query = f'(SELECT {p_col_select} from {name}) q'
-                df_itarate_list = (
-                    spark.read.format('jdbc')
-                    .option('url', self.jdbc_url)
-                    .option('dbtable', iterate_query)
-                    .option('driver', self.driver_jdbc)
-                    .option('fetchsize', fetchsize)
-                    .load()
-                )
-
-                min_max_vals = df_itarate_list.agg(
-                    F.min(p_col_name).alias('min'), F.max(p_col_name).alias('max')
-                ).collect()[0]
-                min_val = min_max_vals[0]
-                max_val = min_max_vals[1]
-                df_itarate_list = df_itarate_list.where(F.col(p_col_name) >= min_val)
-
-            key_list = (
-                df_itarate_list.select(p_col_name)
-                .distinct()
-                .rdd.flatMap(lambda x: x)
-                .collect()
+            df_itarate_list = (
+                spark.read.format('jdbc')
+                .option('url', self.jdbc_url)
+                .option('dbtable', iterate_query)
+                .option('driver', self.driver_jdbc)
+                .option('fetchsize', fetchsize)
+                .load()
             )
-            key_list.sort()
+            min_val = df_itarate_list.first()['min_val']
+            max_val = df_itarate_list.first()['max_val']
 
-            chunks = [
-                key_list[x : x + iterate_batch_size]
-                for x in range(0, len(key_list), iterate_batch_size)
-            ]
-
-            min_max_tuple = [(min(x), max(x)) for x in chunks]
+            if min_val is None or max_val is None:
+                min_max_tuple = None
+            elif iterate_column_type == 'int':
+                min_val = int(min_val)
+                max_val = int(max_val)
+                step = (max_val - min_val) / chunk_count_for_partition
+                min_max_tuple = [
+                    (int(min_val + i * step), int(min_val + (i + 1) * step))
+                    for i in range(chunk_count_for_partition)
+                    if int(min_val + i * step) != int(min_val + (i + 1) * step)
+                ]
+            elif iterate_column_type == 'datetime':
+                step = (max_val - min_val) / chunk_count_for_partition
+                min_max_tuple = [
+                    ((min_val + i * step), (min_val + (i + 1) * step))
+                    for i in range(chunk_count_for_partition)
+                    if (min_val + i * step) != (min_val + (i + 1) * step)
+                ]
+            else:
+                raise ValueError(
+                    f'Unsupported iterate_column_type: {iterate_column_type}'
+                )
 
             if not min_max_tuple:
                 if not last_point:
@@ -207,20 +193,24 @@ class MariadbExtractor:
                     if custom_query:
                         updated_query = custom_query.replace(
                             '{query_filter}',
-                            f""" where {partitions_column} between {min_filter} and {max_filter} """,
+                            f""" where {partitions_column} >= {min_filter} and {partitions_column} < {max_filter} """,
                         )
                     else:
-                        updated_query = f'(SELECT * from {name} where  {partitions_column} between {min_filter} and {max_filter}) q'
-                else:
-                    min_filter = str(chunk[0])
-                    max_filter = str(chunk[-1])
+                        updated_query = f'(SELECT * from {name} where {partitions_column} >= {min_filter} and {partitions_column} < {max_filter}) q'
+                elif iterate_column_type == 'datetime':
+                    min_filter = chunk[0].strftime('%Y-%m-%d %H:%M:%S')
+                    max_filter = chunk[-1].strftime('%Y-%m-%d %H:%M:%S')
                     if custom_query:
                         updated_query = custom_query.replace(
                             '{query_filter}',
-                            f""" where {partitions_column} between '{min_filter}' and '{max_filter}' """,
+                            f""" where {partitions_column} >= '{min_filter}' and {partitions_column} < '{max_filter}' """,
                         )
                     else:
-                        updated_query = f"""(SELECT * from {name} where  {partitions_column} between '{min_filter}' and '{max_filter}') q"""
+                        updated_query = f"""(SELECT * from {name} where  {partitions_column} >= '{min_filter}' and {partitions_column} < '{max_filter}') q"""
+                else:
+                    raise ValueError(
+                        f'Unsupported iterate_column_type: {iterate_column_type}'
+                    )
 
                 df = (
                     spark.read.format('jdbc')
@@ -242,6 +232,7 @@ class MariadbExtractor:
                     .mode(p_write_mode)
                     .parquet(parquet_path)
                 )
+
                 count_col = len(df.columns)
                 count_row = df.count()
                 last_point_value = max_filter
