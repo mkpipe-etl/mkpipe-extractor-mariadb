@@ -130,19 +130,40 @@ class MariadbExtractor:
             elif iterate_column_type == 'int':
                 min_val = int(min_val)
                 max_val = int(max_val)
-                step = (max_val - min_val) / chunk_count_for_partition
-                min_max_tuple = [
-                    (int(min_val + i * step), int(min_val + (i + 1) * step))
-                    for i in range(chunk_count_for_partition)
-                    if int(min_val + i * step) != int(min_val + (i + 1) * step)
-                ]
+
+                total_range = max_val - min_val + 1  # inclusive
+                step = total_range // chunk_count_for_partition
+                remainder = total_range % chunk_count_for_partition
+
+                min_max_tuple = []
+                start = min_val
+                for _ in range(chunk_count_for_partition):
+                    end = start + step - 1
+                    if remainder > 0:
+                        end += 1
+                        remainder -= 1
+                    if start <= max_val:
+                        min_max_tuple.append((start, min(end, max_val)))
+                        start = end + 1
+
             elif iterate_column_type == 'datetime':
-                step = (max_val - min_val) / chunk_count_for_partition
-                min_max_tuple = [
-                    ((min_val + i * step), (min_val + (i + 1) * step))
-                    for i in range(chunk_count_for_partition)
-                    if (min_val + i * step) != (min_val + (i + 1) * step)
-                ]
+                total_seconds = (
+                    int((max_val - min_val).total_seconds()) + 1
+                )  # include max_val
+                step = total_seconds // chunk_count_for_partition
+                remainder = total_seconds % chunk_count_for_partition
+
+                min_max_tuple = []
+                start = min_val
+                for _ in range(chunk_count_for_partition):
+                    step_with_remainder = step
+                    if remainder > 0:
+                        step_with_remainder += 1
+                        remainder -= 1
+                    end = start + datetime.timedelta(seconds=step_with_remainder - 1)
+                    if start <= max_val:
+                        min_max_tuple.append((start, min(end, max_val)))
+                        start = end + datetime.timedelta(seconds=1)
             else:
                 raise ValueError(
                     f'Unsupported iterate_column_type: {iterate_column_type}'
