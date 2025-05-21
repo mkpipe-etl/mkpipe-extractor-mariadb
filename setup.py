@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='mkpipe-extractor-mariadb',
-    version='0.1.3',
+    version='0.2.0',
     license='Apache License 2.0',
     packages=find_packages(exclude=['tests', 'scripts', 'deploy', 'install_jars.py']),
     install_requires=['mkpipe'],
